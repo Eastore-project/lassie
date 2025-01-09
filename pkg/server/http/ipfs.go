@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 
@@ -16,7 +18,10 @@ import (
 	"github.com/filecoin-project/lassie/pkg/types"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-unixfsnode"
+	"github.com/ipfs/go-unixfsnode/file"
 	"github.com/ipld/go-car/v2/storage/deferred"
+	dagpb "github.com/ipld/go-codec-dagpb"
+	"github.com/ipld/go-ipld-prime"
 	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
 	trustlessutils "github.com/ipld/go-trustless-utils"
 	trustlesshttp "github.com/ipld/go-trustless-utils/http"
@@ -55,12 +60,19 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			logger.Debugw("custom X-Request-Id fore retrieval", "request_id", requestId, "retrieval_id", request.RetrievalID)
 		}
 
+		// configure io.writer for temp file
+		writer := os.Stdout
+		// reader := os.Stdin
+		// _, pipeWriter := io.Pipe()
+		// defer pipeReader.Close()
+		// defer pipeWriter.Close()
+
 		tempStore := storage.NewDeferredStorageCar(cfg.TempDir, request.Root)
 		var carWriter storage.DeferredWriter
 		if request.Duplicates {
-			carWriter = storage.NewDuplicateAdderCarForStream(req.Context(), res, request.Root, request.Path, request.Scope, request.Bytes, tempStore)
+			carWriter = storage.NewDuplicateAdderCarForStream(req.Context(), writer, request.Root, request.Path, request.Scope, request.Bytes, tempStore)
 		} else {
-			carWriter = deferred.NewDeferredCarWriterForStream(res, []cid.Cid{request.Root})
+			carWriter = deferred.NewDeferredCarWriterForStream(writer, []cid.Cid{request.Root})
 		}
 		carStore := storage.NewCachingTempStore(carWriter.BlockWriteOpener(), tempStore)
 		defer func() {
@@ -71,6 +83,13 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 
 		request.LinkSystem.SetWriteStorage(carStore)
 		request.LinkSystem.SetReadStorage(carStore)
+		
+		// newStore, err := storage.NewStdinReadStorage(reader) 
+		// if err != nil {
+		// 	logger.Infof("error creating new storage: %s", err)
+		// }
+		// copyLinkSystem := request.LinkSystem
+		// copyLinkSystem.SetReadStorage(newStore)
 
 		// setup preload storage for bitswap, the temporary CAR store can set up a
 		// separate preload space in its storage
@@ -108,9 +127,8 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			"dups", request.Duplicates,
 			"maxBlocks", request.MaxBlocks,
 		)
-
 		stats, err := fetcher.Fetch(req.Context(), request, types.WithEventsCallback(servertimingsSubscriber(req, bytesWritten)))
-
+		
 		// force all blocks to flush
 		if cerr := carWriter.Close(); cerr != nil && !errors.Is(cerr, context.Canceled) {
 			logger.Infof("error closing car writer: %s", cerr)
@@ -133,6 +151,26 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			}
 			return
 		}
+		ls := request.LinkSystem
+		pbn, err := ls.Load(ipld.LinkContext{}, cidlink.Link{Cid: request.Root}, dagpb.Type.PBNode)
+		if err != nil {
+			logger.Error(err)
+			return 
+		}
+		pbnode := pbn.(dagpb.PBNode)
+	
+		ufn, err := unixfsnode.Reify(ipld.LinkContext{}, pbnode, &ls)
+		if err != nil {
+			logger.Error(err)
+
+			return 
+		}
+		err = extractFile(context.Background(), &request.LinkSystem, ufn, res)
+        if err != nil {
+            logger.Infof("error during extract and stream: %s", err)
+            http.Error(res, "Internal Server Error", http.StatusInternalServerError)
+            return
+        }
 
 		logger.Debugw("successfully fetched",
 			"retrieval_id", request.RetrievalID,
@@ -341,4 +379,21 @@ func closeWithUnterminatedChunk(res http.ResponseWriter) error {
 		return fmt.Errorf("closing write conn: %w", err)
 	}
 	return nil
+}
+
+
+// extractFile writes the extracted file content to the provided io.Writer.
+func extractFile(c context.Context, ls *ipld.LinkSystem, n ipld.Node, writer io.Writer) error {
+    node, err := file.NewUnixFSFile(c, n, ls)
+    if err != nil {
+        return err
+    }
+
+    nlr, err := node.AsLargeBytes()
+    if err != nil {
+        return err
+    }
+
+    _, err = io.Copy(writer, nlr)
+    return err
 }
