@@ -109,6 +109,10 @@ func newDuplicateAdderCar(
 	}
 }
 
+func (da *DuplicateAdderCar) GetBlockStream() *blockStream {
+	return da.blockStream
+}
+
 func (da *DuplicateAdderCar) addDupes() {
 	var err error
 	defer func() {
@@ -197,34 +201,41 @@ type blockStream struct {
 }
 
 func (bs *blockStream) Close() {
+	bs.cond.Signal()
+
 	bs.mu.Lock()
+
+	fmt.Println("Closing blockstream") // Added log
 	bs.done = true
 	bs.mu.Unlock()
 	bs.cond.Signal()
 }
 
 func (bs *blockStream) WriteBlock(blk blocks.Block) error {
-	if bs.ctx.Err() != nil {
-		return bs.ctx.Err()
-	}
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
-	if bs.done {
-		return errClosed
-	}
-	if _, ok := bs.seen[blk.Cid()]; ok {
-		return nil
-	}
-	bs.seen[blk.Cid()] = struct{}{}
-	bs.blockBuffer.PushBack(blk)
-	bs.cond.Signal()
-	return nil
+    if bs.ctx.Err() != nil {
+        return bs.ctx.Err()
+    }
+    bs.mu.Lock()
+    defer bs.mu.Unlock()
+    if bs.done {
+        return errClosed
+    }
+    cid := blk.Cid()
+    fmt.Println("Writing block blockstream, ", cid.String())
+    if _, ok := bs.seen[cid]; ok {
+        return nil
+    }
+    fmt.Println("Marking block as seen: ", cid.String()) // Added log
+    bs.seen[cid] = struct{}{}
+    bs.blockBuffer.PushBack(blk)
+    bs.cond.Signal()
+    return nil
 }
 
 func (bs *blockStream) Next(ctx context.Context) (blocks.Block, error) {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
-
+	fmt.Println("Waiting for next block") // Added log
 	for {
 		select {
 		case <-bs.ctx.Done():
@@ -234,11 +245,17 @@ func (bs *blockStream) Next(ctx context.Context) (blocks.Block, error) {
 		default:
 		}
 		if e := bs.blockBuffer.Front(); e != nil {
-			return bs.blockBuffer.Remove(e).(blocks.Block), nil
+			block := bs.blockBuffer.Remove(e).(blocks.Block)
+			fmt.Println("Returning block from blockstream ", block.Cid().String())
+			return block, nil
+		} else {
+			fmt.Println("No block in buffer") // Added log
 		}
 		if bs.done {
+			fmt.Println("Returning EOF")
 			return nil, io.EOF
 		}
+		fmt.Println("Waiting for blockstream") // Added log
 		bs.cond.Wait()
 	}
 }

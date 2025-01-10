@@ -2,11 +2,11 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 
 	"github.com/ipfs/go-cid"
-	"github.com/ipld/go-car/v2"
 	carstorage "github.com/ipld/go-car/v2/storage"
 	"github.com/ipld/go-ipld-prime/storage"
 )
@@ -20,21 +20,23 @@ type stdinReadStorage struct {
 	cond   *sync.Cond
 }
 
-func NewStdinReadStorage(reader io.Reader) (*stdinReadStorage, []cid.Cid, error) {
+func NewStdinReadStorage(ctx context.Context, rdr *blockStream) (*stdinReadStorage, error) {
 	var lk sync.RWMutex
 	srs := &stdinReadStorage{
 		blocks: make(map[string][]byte),
 		lk:     &lk,
 		cond:   sync.NewCond(&lk),
 	}
-	rdr, err := car.NewBlockReader(reader)
-	if err != nil {
-		return nil, nil, err
-	}
+	// rdr, err := car.NewBlockReader(reader)
+	// if err != nil {
+	// 	return nil, nil, err
+	// }
 	go func() {
 		for {
-			blk, err := rdr.Next()
+			fmt.Println("Reading next block")
+			blk, err := rdr.Next(ctx)
 			if err == io.EOF {
+				fmt.Println("Received EOF from rdr.Next") // Added log
 				srs.lk.Lock()
 				srs.done = true
 				srs.cond.Broadcast()
@@ -42,15 +44,17 @@ func NewStdinReadStorage(reader io.Reader) (*stdinReadStorage, []cid.Cid, error)
 				return
 			}
 			if err != nil {
+				fmt.Println("Error from rdr.Next:", err) // Added log
 				panic(err)
 			}
+			fmt.Println("Got block, ", blk.Cid().String())
 			srs.lk.Lock()
 			srs.blocks[string(blk.Cid().Hash())] = blk.RawData()
 			srs.cond.Broadcast()
 			srs.lk.Unlock()
 		}
 	}()
-	return srs, rdr.Roots, nil
+	return srs, nil
 }
 
 func (srs *stdinReadStorage) Has(ctx context.Context, key string) (bool, error) {
@@ -60,21 +64,23 @@ func (srs *stdinReadStorage) Has(ctx context.Context, key string) (bool, error) 
 	}
 	return true, nil
 }
-
 func (srs *stdinReadStorage) Get(ctx context.Context, key string) ([]byte, error) {
-	c, err := cid.Cast([]byte(key))
-	if err != nil {
-		return nil, err
-	}
-	srs.lk.Lock()
-	defer srs.lk.Unlock()
-	for {
-		if data, ok := srs.blocks[string(c.Hash())]; ok {
-			return data, nil
-		}
-		if srs.done {
-			return nil, carstorage.ErrNotFound{Cid: c}
-		}
-		srs.cond.Wait()
-	}
+    c, err := cid.Cast([]byte(key))
+    if err != nil {
+        return nil, err
+    }
+    srs.lk.Lock()
+    defer srs.lk.Unlock()
+    for {
+        fmt.Println("Getting block, ", c.String())
+        if data, ok := srs.blocks[string(c.Hash())]; ok {
+            fmt.Println("Returning block data for CID: ", c.String())
+            return data, nil
+        }
+        if srs.done {
+            fmt.Println("No block found and done is true for CID: ", c.String())
+            return nil, carstorage.ErrNotFound{Cid: c}
+        }
+        srs.cond.Wait()
+    }
 }
