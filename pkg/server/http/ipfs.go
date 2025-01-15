@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/filecoin-project/lassie/pkg/build"
 	"github.com/filecoin-project/lassie/pkg/heyfil"
@@ -16,7 +18,11 @@ import (
 	"github.com/filecoin-project/lassie/pkg/types"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-unixfsnode"
-	"github.com/ipld/go-car/v2/storage/deferred"
+	"github.com/ipfs/go-unixfsnode/file"
+
+	dagpb "github.com/ipld/go-codec-dagpb"
+
+	"github.com/ipld/go-ipld-prime"
 	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
 	trustlessutils "github.com/ipld/go-trustless-utils"
 	trustlesshttp "github.com/ipld/go-trustless-utils/http"
@@ -54,37 +60,45 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 		} else {
 			logger.Debugw("custom X-Request-Id fore retrieval", "request_id", requestId, "retrieval_id", request.RetrievalID)
 		}
+		pipeReader, pipeWriter := io.Pipe()
 
-		tempStore := storage.NewDeferredStorageCar(cfg.TempDir, request.Root)
-		var carWriter storage.DeferredWriter
-		if request.Duplicates {
-			carWriter = storage.NewDuplicateAdderCarForStream(req.Context(), res, request.Root, request.Path, request.Scope, request.Bytes, tempStore)
-		} else {
-			carWriter = deferred.NewDeferredCarWriterForStream(res, []cid.Cid{request.Root})
-		}
-		carStore := storage.NewCachingTempStore(carWriter.BlockWriteOpener(), tempStore)
-		defer func() {
-			if err := carStore.Close(); err != nil {
-				logger.Errorf("error closing temp store: %s", err)
-			}
-		}()
 
-		request.LinkSystem.SetWriteStorage(carStore)
-		request.LinkSystem.SetReadStorage(carStore)
+		// tempStore := storage.NewDeferredStorageCar(cfg.TempDir, request.Root)
+		// var carWriter storage.DeferredWriter
+		// if request.Duplicates {
+		// 	carWriter = *storage.NewDuplicateAdderCarForStream(req.Context(), res, request.Root, request.Path, request.Scope, request.Bytes, tempStore)
+		// }
+		// // else {
+		// // 	carWriter = deferred.NewDeferredCarWriterForStream(writer, []cid.Cid{request.Root})
+		// // }
+		// carStore := storage.NewCachingTempStore(carWriter.BlockWriteOpener(), tempStore)
+		// defer func() {
+		// 	if err := carStore.Close(); err != nil {
+		// 		logger.Errorf("error closing temp store: %s", err)
+		// 	}
+		// }()
+
+		// request.LinkSystem.SetWriteStorage(carStore)
+		// request.LinkSystem.SetReadStorage(carStore)
+
+		newStore := storage.NewExtractStorageCar(pipeWriter, request.Root) 
+		request.LinkSystem.SetWriteStorage(newStore)
+		request.LinkSystem.SetReadStorage(newStore)
+
 
 		// setup preload storage for bitswap, the temporary CAR store can set up a
 		// separate preload space in its storage
-		request.PreloadLinkSystem = cidlink.DefaultLinkSystem()
-		preloadStore := carStore.PreloadStore()
-		request.PreloadLinkSystem.SetReadStorage(preloadStore)
-		request.PreloadLinkSystem.SetWriteStorage(preloadStore)
-		request.PreloadLinkSystem.TrustedStorage = true
+		// request.PreloadLinkSystem = cidlink.DefaultLinkSystem()
+		// preloadStore := carStore.PreloadStore()
+		// request.PreloadLinkSystem.SetReadStorage(preloadStore)
+		// request.PreloadLinkSystem.SetWriteStorage(preloadStore)
+		// request.PreloadLinkSystem.TrustedStorage = true
 
 		// bytesWritten will be closed once we've started writing CAR content to
 		// the response writer. Once closed, no other content should be written.
 		bytesWritten := make(chan struct{}, 1)
 
-		carWriter.OnPut(func(int) {
+		newStore.OnPut(func() {
 			// called once we start writing blocks into the CAR (on the first Put())
 			res.Header().Set("Server", build.UserAgent) // "lassie/vx.y.z-<git commit hash>"
 			res.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fileName))
@@ -97,8 +111,53 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			res.Header().Set("X-Trace-Id", requestId)
 			statusLogger.logStatus(200, "OK")
 			close(bytesWritten)
-		}, true)
+		})
 
+		var extractWg sync.WaitGroup
+		extractWg.Add(1)
+		var newExtractStore *storage.StdinReadStorage
+        go func() {
+			defer extractWg.Done()
+
+			ls := cidlink.DefaultLinkSystem()
+			ls.TrustedStorage = true
+			unixfsnode.AddUnixFSReificationToLinkSystem(&ls)
+			newExtractStore, err = storage.NewStdinReadStorage(req.Context(), pipeReader)
+			if err == io.EOF {
+				logger.Infof("EOF received, no-candidates")
+				errorResponse(res, statusLogger, http.StatusBadGateway, errors.New("no candidates found"))
+				pipeReader.Close()
+				pipeWriter.Close()
+				return
+			}
+			if err != nil {
+				logger.Errorf("error creating new storage: %s", err)
+				errorResponse(res, statusLogger, http.StatusInternalServerError, err)
+				return
+			}
+			ls.SetReadStorage(newExtractStore)
+			pbn, err := ls.Load(ipld.LinkContext{}, cidlink.Link{Cid: request.Root}, dagpb.Type.PBNode)
+			if err != nil {
+				logger.Error(err)
+				errorResponse(res, statusLogger, http.StatusInternalServerError, err)
+				return 
+			}
+			pbnode := pbn.(dagpb.PBNode)
+		
+			_, err = unixfsnode.Reify(ipld.LinkContext{}, pbnode, &ls)
+			if err != nil {
+				logger.Error(err)
+				return 
+			}
+			
+			err = extractFile(context.Background(), &ls, pbnode, res)
+			if err != nil {
+			    logger.Error("error during extract and stream: %s", err)
+				errorResponse(res, statusLogger, http.StatusInternalServerError, err)
+			    return
+				}			
+			}()
+			
 		logger.Debugw("fetching",
 			"retrieval_id", request.RetrievalID,
 			"root", request.Root.String(),
@@ -108,13 +167,16 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			"dups", request.Duplicates,
 			"maxBlocks", request.MaxBlocks,
 		)
-
 		stats, err := fetcher.Fetch(req.Context(), request, types.WithEventsCallback(servertimingsSubscriber(req, bytesWritten)))
-
+		// Close the writer after fetch is complete
 		// force all blocks to flush
-		if cerr := carWriter.Close(); cerr != nil && !errors.Is(cerr, context.Canceled) {
+		if cerr := newStore.Close(); cerr != nil && !errors.Is(cerr, context.Canceled) {
 			logger.Infof("error closing car writer: %s", cerr)
 		}
+		if err := pipeWriter.Close(); err != nil {
+			logger.Errorf("error closing pipe writer: %s", err)
+		}
+		extractWg.Wait()
 
 		if err != nil {
 			select {
@@ -129,7 +191,7 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			if errors.Is(err, retriever.ErrNoCandidates) {
 				errorResponse(res, statusLogger, http.StatusBadGateway, errors.New("no candidates found"))
 			} else {
-				errorResponse(res, statusLogger, http.StatusGatewayTimeout, fmt.Errorf("failed to fetch CID: %w", err))
+				errorResponse(res, statusLogger, http.StatusGatewayTimeout, fmt.Errorf("failed to extract CID: %w", err))
 			}
 			return
 		}
@@ -341,4 +403,19 @@ func closeWithUnterminatedChunk(res http.ResponseWriter) error {
 		return fmt.Errorf("closing write conn: %w", err)
 	}
 	return nil
+}
+
+
+// extractFile writes the extracted file content to the provided io.Writer.
+func extractFile(c context.Context, ls *ipld.LinkSystem, n ipld.Node, writer io.Writer) error {
+    node, err := file.NewUnixFSFile(c, n, ls)
+    if err != nil {
+        return err
+    }
+    nlr, err := node.AsLargeBytes()
+    if err != nil {
+        return err
+    }
+    _, err = io.Copy(writer, nlr)
+    return err
 }
