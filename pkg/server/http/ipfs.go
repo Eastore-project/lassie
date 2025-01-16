@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -324,7 +325,7 @@ func decodeRetrievalRequest(cfg HttpServerConfig, res http.ResponseWriter, req *
 }
 
 func decodeFilename(res http.ResponseWriter, req *http.Request, statusLogger *statusLogger, root cid.Cid) (bool, string) {
-	fileName, err := trustlesshttp.ParseFilename(req)
+	fileName, err := parseFilename(req)
 	if err != nil {
 		errorResponse(res, statusLogger, http.StatusBadRequest, err)
 		return false, ""
@@ -418,4 +419,17 @@ func extractFile(c context.Context, ls *ipld.LinkSystem, n ipld.Node, writer io.
     }
     _, err = io.Copy(writer, nlr)
     return err
+}
+
+func parseFilename(req *http.Request) (string, error) {
+	// check if provided filename query parameter has .car extension
+	if req.URL.Query().Has("filename") {
+		filename := req.URL.Query().Get("filename")
+		ext := filepath.Ext(filename)
+		if ext == "" {
+			return "", errors.New("invalid filename parameter; missing extension")
+		}
+		return filename, nil
+	}
+	return "", nil
 }
