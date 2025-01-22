@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/http/pprof"
 
 	"github.com/filecoin-project/lassie/pkg/lassie"
 	"github.com/ipfs/go-log/v2"
@@ -28,6 +27,7 @@ type HttpServerConfig struct {
 	TempDir             string
 	MaxBlocksPerRequest uint64
 	AccessToken         string
+	Database            bool
 }
 
 type contextKey struct {
@@ -76,11 +76,11 @@ func NewHttpServer(ctx context.Context, lassie *lassie.Lassie, cfg HttpServerCon
 	mux.HandleFunc("/ipfs/", IpfsHandler(lassie, cfg))
 
 	// Handle pprof endpoints
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	// mux.HandleFunc("/debug/pprof/", pprof.Index)
+	// mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	// mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	// mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	// mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
 	return httpServer, nil
 }

@@ -23,6 +23,7 @@ import (
 
 	dagpb "github.com/ipld/go-codec-dagpb"
 
+	"github.com/filecoin-project/lassie/internal/db"
 	"github.com/ipld/go-ipld-prime"
 	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
 	trustlessutils "github.com/ipld/go-trustless-utils"
@@ -32,6 +33,7 @@ import (
 
 func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.ResponseWriter, *http.Request) {
 	return func(res http.ResponseWriter, req *http.Request) {
+		fmt.Println("Recieved request with url path: ", req.URL)
 		unescapedPath, err := url.PathUnescape(req.URL.Path)
 		if err != nil {
 			logger.Warnf("error unescaping path: %s", err)
@@ -221,7 +223,7 @@ func checkGet(req *http.Request, res http.ResponseWriter, statusLogger *statusLo
 	return false
 }
 
-func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath string, statusLogger *statusLogger) (bool, trustlessutils.Request) {
+func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath string, cfg HttpServerConfig, statusLogger *statusLogger) (bool, trustlessutils.Request) {
 	rootCid, path, err := trustlesshttp.ParseUrlPath(unescapedPath)
 	if err != nil {
 		if errors.Is(err, trustlesshttp.ErrPathNotFound) {
@@ -232,6 +234,27 @@ func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath str
 			errorResponse(res, statusLogger, http.StatusInternalServerError, err)
 		}
 		return false, trustlessutils.Request{}
+	}
+
+	// if Database is true, look up the real CID by pieceCid
+	if cfg.Database {
+		cidStr, dbErr := db.GetCidByPieceCid(rootCid.String())
+		if dbErr != nil {
+			errorResponse(res, statusLogger, http.StatusInternalServerError, dbErr)
+			return false, trustlessutils.Request{}
+		}
+		if cidStr != nil {
+			newCid, parseErr := cid.Parse(*cidStr)
+			if parseErr == nil {
+				rootCid = newCid
+			} else {
+				errorResponse(res, statusLogger, http.StatusInternalServerError, parseErr)
+				return false, trustlessutils.Request{}
+			}
+		} else {
+			errorResponse(res, statusLogger, http.StatusNotFound, errors.New("CID not found"))
+			return false, trustlessutils.Request{}
+		}
 	}
 
 	accepts, err := trustlesshttp.CheckFormat(req)
@@ -275,7 +298,7 @@ func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath str
 }
 
 func decodeRetrievalRequest(cfg HttpServerConfig, res http.ResponseWriter, req *http.Request, unescapedPath string, statusLogger *statusLogger) (bool, types.RetrievalRequest) {
-	ok, request := decodeRequest(res, req, unescapedPath, statusLogger)
+	ok, request := decodeRequest(res, req, unescapedPath, cfg, statusLogger)
 	if !ok {
 		return false, types.RetrievalRequest{}
 	}

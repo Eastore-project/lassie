@@ -1,10 +1,13 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/filecoin-project/lassie/internal/db"
 	"github.com/filecoin-project/lassie/pkg/heyfil"
 	"github.com/filecoin-project/lassie/pkg/lassie"
 	"github.com/filecoin-project/lassie/pkg/types"
@@ -209,6 +212,24 @@ var FlagIPNIEndpoint = &cli.StringFlag{
 	Aliases:     []string{"ipni"},
 	DefaultText: "Defaults to https://cid.contact",
 	Usage:       "HTTP endpoint of the IPNI instance used to discover providers.",
+}
+
+var FlagDatabase = &cli.BoolFlag{
+	Name:  "with-database",
+	Usage: "if set, initialize MongoDB (MONGODB_URI) and enable database mode",
+	Value: false,
+	Action: func(cctx *cli.Context, _ bool) error {
+		if cctx.Bool("with-database") {
+			uri := os.Getenv("EASTORE_MONGODB_URI")
+            if uri == "" {
+                return errors.New("EASTORE_MONGODB_URI environment variable is not set")
+            }
+            if err := db.InitDB(uri); err != nil {
+                return fmt.Errorf("failed to initialize MongoDB: %w", err)
+            }
+		}
+		return nil
+	},
 }
 
 func ResetGlobalFlags() {

@@ -3,5 +3,6 @@
 /cmd/lassie/lassie
 /lassie
 *.car
+.env
 
 dist/
