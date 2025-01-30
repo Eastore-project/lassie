@@ -50,6 +50,12 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			return
 		}
 
+		fileSize, err := decodeFileSize(req)
+		if err != nil {
+			errorResponse(res, statusLogger, http.StatusBadRequest, err)
+			return
+		}
+
 		ok, fileName := decodeFilename(res, req, statusLogger, request.Root)
 		if !ok {
 			return
@@ -112,6 +118,9 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			res.Header().Set("X-Content-Type-Options", "nosniff")
 			res.Header().Set("X-Ipfs-Path", trustlessutils.PathEscape(unescapedPath))
 			res.Header().Set("X-Trace-Id", requestId)
+			if fileSize > 0 {
+				res.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+			}
 			statusLogger.logStatus(200, "OK")
 			close(bytesWritten)
 		})
@@ -455,4 +464,16 @@ func parseFilename(req *http.Request) (string, error) {
 		return filename, nil
 	}
 	return "", nil
+}
+
+func decodeFileSize(req *http.Request) (int64, error) {
+	if !req.URL.Query().Has("filesize") {
+		return 0, nil
+	}
+	val := req.URL.Query().Get("filesize")
+	size, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid fileSize parameter: %w", err)
+	}
+	return size, nil
 }
