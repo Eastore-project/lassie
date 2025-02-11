@@ -31,8 +31,17 @@ import (
 	"github.com/multiformats/go-multicodec"
 )
 
+// Add a helper function to set CORS headers
+func setCorsHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Request-Id")
+}
+
 func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.ResponseWriter, *http.Request) {
 	return func(res http.ResponseWriter, req *http.Request) {
+		// Set CORS headers for every response
+
 		fmt.Println("Recieved request with url path: ", req.URL)
 		unescapedPath, err := url.PathUnescape(req.URL.Path)
 		if err != nil {
@@ -109,6 +118,7 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 
 		newStore.OnPut(func() {
 			// called once we start writing blocks into the CAR (on the first Put())
+			setCorsHeaders(res)
 			res.Header().Set("Server", build.UserAgent) // "lassie/vx.y.z-<git commit hash>"
 			res.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fileName))
 			res.Header().Set("Accept-Ranges", "none")
