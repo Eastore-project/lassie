@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -123,7 +124,12 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			res.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fileName))
 			res.Header().Set("Accept-Ranges", "none")
 			res.Header().Set("Cache-Control", trustlesshttp.ResponseCacheControlHeader)
-			res.Header().Set("Content-Type", trustlesshttp.DefaultContentType().WithDuplicates(request.Duplicates).String())
+			// Update: set Content-Type based on the file extension from fileName.
+			ct := mime.TypeByExtension(filepath.Ext(fileName))
+			if ct == "" {
+				ct = "application/octet-stream"
+			}
+			res.Header().Set("Content-Type", ct)
 			res.Header().Set("Etag", request.Etag())
 			res.Header().Set("X-Content-Type-Options", "nosniff")
 			res.Header().Set("X-Ipfs-Path", trustlessutils.PathEscape(unescapedPath))
