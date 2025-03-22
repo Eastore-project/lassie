@@ -55,7 +55,7 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			return
 		}
 
-		ok, request := decodeRetrievalRequest(cfg, res, req, unescapedPath, statusLogger)
+		ok, request, dbFilename := decodeRetrievalRequest(cfg, res, req, unescapedPath, statusLogger)
 		if !ok {
 			return
 		}
@@ -66,9 +66,20 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			return
 		}
 
-		ok, fileName := decodeFilename(res, req, statusLogger, request.Root)
-		if !ok {
+		// First check URL parameter for filename, if not found use database filename
+		fileName, err := parseFilename(req)
+		if err != nil {
+			errorResponse(res, statusLogger, http.StatusBadRequest, err)
 			return
+		}
+
+		if fileName == "" && dbFilename != "" {
+			fileName = dbFilename
+		}
+
+		// If still no filename, use default CID-based name
+		if fileName == "" {
+			fileName = fmt.Sprintf("%s%s", request.Root, trustlesshttp.FilenameExtCar)
 		}
 
 		// TODO: this needs to be propagated through the request, perhaps on
@@ -80,7 +91,6 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			logger.Debugw("custom X-Request-Id fore retrieval", "request_id", requestId, "retrieval_id", request.RetrievalID)
 		}
 		pipeReader, pipeWriter := io.Pipe()
-
 
 		// tempStore := storage.NewDeferredStorageCar(cfg.TempDir, request.Root)
 		// var carWriter storage.DeferredWriter
@@ -100,10 +110,9 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 		// request.LinkSystem.SetWriteStorage(carStore)
 		// request.LinkSystem.SetReadStorage(carStore)
 
-		newStore := storage.NewExtractStorageCar(pipeWriter, request.Root) 
+		newStore := storage.NewExtractStorageCar(pipeWriter, request.Root)
 		request.LinkSystem.SetWriteStorage(newStore)
 		request.LinkSystem.SetReadStorage(newStore)
-
 
 		// setup preload storage for bitswap, the temporary CAR store can set up a
 		// separate preload space in its storage
@@ -144,7 +153,7 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 		var extractWg sync.WaitGroup
 		extractWg.Add(1)
 		var newExtractStore *storage.StdinReadStorage
-        go func() {
+		go func() {
 			defer extractWg.Done()
 
 			ls := cidlink.DefaultLinkSystem()
@@ -168,24 +177,24 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			if err != nil {
 				logger.Error(err)
 				errorResponse(res, statusLogger, http.StatusInternalServerError, err)
-				return 
+				return
 			}
 			pbnode := pbn.(dagpb.PBNode)
-		
+
 			_, err = unixfsnode.Reify(ipld.LinkContext{}, pbnode, &ls)
 			if err != nil {
 				logger.Error(err)
-				return 
+				return
 			}
-			
+
 			err = extractFile(context.Background(), &ls, pbnode, res)
 			if err != nil {
-			    logger.Error("error during extract and stream: %s", err)
+				logger.Error("error during extract and stream: %s", err)
 				errorResponse(res, statusLogger, http.StatusInternalServerError, err)
-			    return
-				}			
-			}()
-			
+				return
+			}
+		}()
+
 		logger.Debugw("fetching",
 			"retrieval_id", request.RetrievalID,
 			"root", request.Root.String(),
@@ -248,7 +257,7 @@ func checkGet(req *http.Request, res http.ResponseWriter, statusLogger *statusLo
 	return false
 }
 
-func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath string, cfg HttpServerConfig, statusLogger *statusLogger) (bool, trustlessutils.Request) {
+func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath string, cfg HttpServerConfig, statusLogger *statusLogger) (bool, trustlessutils.Request, string) {
 	rootCid, path, err := trustlesshttp.ParseUrlPath(unescapedPath)
 	if err != nil {
 		if errors.Is(err, trustlesshttp.ErrPathNotFound) {
@@ -258,34 +267,36 @@ func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath str
 		} else {
 			errorResponse(res, statusLogger, http.StatusInternalServerError, err)
 		}
-		return false, trustlessutils.Request{}
+		return false, trustlessutils.Request{}, ""
 	}
 
-	// if Database is true, look up the real CID by pieceCid
+	var dbFilename string
+	// if Database is true, look up the file by rootCid which is the pieceCid from the URL
 	if cfg.Database {
-		cidStr, dbErr := db.GetCidByPieceCid(rootCid.String())
+		file, dbErr := db.GetFileByPieceCid(rootCid.String())
 		if dbErr != nil {
 			errorResponse(res, statusLogger, http.StatusInternalServerError, dbErr)
-			return false, trustlessutils.Request{}
+			return false, trustlessutils.Request{}, ""
 		}
-		if cidStr != nil {
-			newCid, parseErr := cid.Parse(*cidStr)
+		if file != nil {
+			newCid, parseErr := cid.Parse(file.CID)
 			if parseErr == nil {
 				rootCid = newCid
+				dbFilename = file.Name // Store filename from database
 			} else {
 				errorResponse(res, statusLogger, http.StatusInternalServerError, parseErr)
-				return false, trustlessutils.Request{}
+				return false, trustlessutils.Request{}, ""
 			}
 		} else {
 			errorResponse(res, statusLogger, http.StatusNotFound, errors.New("CID not found"))
-			return false, trustlessutils.Request{}
+			return false, trustlessutils.Request{}, ""
 		}
 	}
 
 	accepts, err := trustlesshttp.CheckFormat(req)
 	if err != nil {
 		errorResponse(res, statusLogger, http.StatusBadRequest, err)
-		return false, trustlessutils.Request{}
+		return false, trustlessutils.Request{}, ""
 	}
 	// TODO: accepts[0] should be acceptable but it may be for a
 	// application/ipld.vnd.raw (IsRaw()) which we don't currently support; we
@@ -304,13 +315,13 @@ func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath str
 	dagScope, err := trustlesshttp.ParseScope(req)
 	if err != nil {
 		errorResponse(res, statusLogger, http.StatusBadRequest, err)
-		return false, trustlessutils.Request{}
+		return false, trustlessutils.Request{}, ""
 	}
 
 	byteRange, err := trustlesshttp.ParseByteRange(req)
 	if err != nil {
 		errorResponse(res, statusLogger, http.StatusBadRequest, err)
-		return false, trustlessutils.Request{}
+		return false, trustlessutils.Request{}, ""
 	}
 
 	return true, trustlessutils.Request{
@@ -319,25 +330,25 @@ func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath str
 		Scope:      dagScope,
 		Bytes:      byteRange,
 		Duplicates: accept.Duplicates,
-	}
+	}, dbFilename
 }
 
-func decodeRetrievalRequest(cfg HttpServerConfig, res http.ResponseWriter, req *http.Request, unescapedPath string, statusLogger *statusLogger) (bool, types.RetrievalRequest) {
-	ok, request := decodeRequest(res, req, unescapedPath, cfg, statusLogger)
+func decodeRetrievalRequest(cfg HttpServerConfig, res http.ResponseWriter, req *http.Request, unescapedPath string, statusLogger *statusLogger) (bool, types.RetrievalRequest, string) {
+	ok, request, dbFilename := decodeRequest(res, req, unescapedPath, cfg, statusLogger)
 	if !ok {
-		return false, types.RetrievalRequest{}
+		return false, types.RetrievalRequest{}, ""
 	}
 
 	protocols, err := parseProtocols(req)
 	if err != nil {
 		errorResponse(res, statusLogger, http.StatusBadRequest, err)
-		return false, types.RetrievalRequest{}
+		return false, types.RetrievalRequest{}, ""
 	}
 
 	providers, err := parseProviders(req)
 	if err != nil {
 		errorResponse(res, statusLogger, http.StatusBadRequest, err)
-		return false, types.RetrievalRequest{}
+		return false, types.RetrievalRequest{}, ""
 	}
 
 	// extract block limit from query param as needed
@@ -355,7 +366,7 @@ func decodeRetrievalRequest(cfg HttpServerConfig, res http.ResponseWriter, req *
 	retrievalId, err := types.NewRetrievalID()
 	if err != nil {
 		errorResponse(res, statusLogger, http.StatusInternalServerError, fmt.Errorf("failed to generate retrieval ID: %w", err))
-		return false, types.RetrievalRequest{}
+		return false, types.RetrievalRequest{}, ""
 	}
 
 	linkSystem := cidlink.DefaultLinkSystem()
@@ -369,20 +380,7 @@ func decodeRetrievalRequest(cfg HttpServerConfig, res http.ResponseWriter, req *
 		Protocols:   protocols,
 		Providers:   providers,
 		MaxBlocks:   maxBlocks,
-	}
-}
-
-func decodeFilename(res http.ResponseWriter, req *http.Request, statusLogger *statusLogger, root cid.Cid) (bool, string) {
-	fileName, err := parseFilename(req)
-	if err != nil {
-		errorResponse(res, statusLogger, http.StatusBadRequest, err)
-		return false, ""
-	}
-	// for setting Content-Disposition header based on filename url parameter
-	if fileName == "" {
-		fileName = fmt.Sprintf("%s%s", root, trustlesshttp.FilenameExtCar)
-	}
-	return true, fileName
+	}, dbFilename
 }
 
 // statusLogger is a logger for logging response statuses for a given request
@@ -454,19 +452,18 @@ func closeWithUnterminatedChunk(res http.ResponseWriter) error {
 	return nil
 }
 
-
 // extractFile writes the extracted file content to the provided io.Writer.
 func extractFile(c context.Context, ls *ipld.LinkSystem, n ipld.Node, writer io.Writer) error {
-    node, err := file.NewUnixFSFile(c, n, ls)
-    if err != nil {
-        return err
-    }
-    nlr, err := node.AsLargeBytes()
-    if err != nil {
-        return err
-    }
-    _, err = io.Copy(writer, nlr)
-    return err
+	node, err := file.NewUnixFSFile(c, n, ls)
+	if err != nil {
+		return err
+	}
+	nlr, err := node.AsLargeBytes()
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(writer, nlr)
+	return err
 }
 
 func parseFilename(req *http.Request) (string, error) {
