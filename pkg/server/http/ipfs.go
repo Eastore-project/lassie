@@ -55,26 +55,33 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			return
 		}
 
-		ok, request, dbFilename := decodeRetrievalRequest(cfg, res, req, unescapedPath, statusLogger)
+		ok, request, dbFile := decodeRetrievalRequest(cfg, res, req, unescapedPath, statusLogger)
 		if !ok {
 			return
 		}
 
-		fileSize, err := decodeFileSize(req)
+		// Get fileSize from URL parameter or database
+		urlFileSize, err := decodeFileSize(req)
 		if err != nil {
 			errorResponse(res, statusLogger, http.StatusBadRequest, err)
 			return
 		}
 
-		// First check URL parameter for filename, if not found use database filename
+		// If URL fileSize is not provided, use database fileSize if available
+		fileSize := urlFileSize
+		if fileSize == 0 && dbFile != nil {
+			fileSize = int64(dbFile.Size)
+		}
+
+		// Get filename from URL parameter or database
 		fileName, err := parseFilename(req)
 		if err != nil {
 			errorResponse(res, statusLogger, http.StatusBadRequest, err)
 			return
 		}
 
-		if fileName == "" && dbFilename != "" {
-			fileName = dbFilename
+		if fileName == "" && dbFile != nil && dbFile.Name != "" {
+			fileName = dbFile.Name
 		}
 
 		// If still no filename, use default CID-based name
@@ -257,7 +264,7 @@ func checkGet(req *http.Request, res http.ResponseWriter, statusLogger *statusLo
 	return false
 }
 
-func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath string, cfg HttpServerConfig, statusLogger *statusLogger) (bool, trustlessutils.Request, string) {
+func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath string, cfg HttpServerConfig, statusLogger *statusLogger) (bool, trustlessutils.Request, *db.File) {
 	rootCid, path, err := trustlesshttp.ParseUrlPath(unescapedPath)
 	if err != nil {
 		if errors.Is(err, trustlesshttp.ErrPathNotFound) {
@@ -267,36 +274,35 @@ func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath str
 		} else {
 			errorResponse(res, statusLogger, http.StatusInternalServerError, err)
 		}
-		return false, trustlessutils.Request{}, ""
+		return false, trustlessutils.Request{}, nil
 	}
 
-	var dbFilename string
+	var dbFile *db.File
 	// if Database is true, look up the file by rootCid which is the pieceCid from the URL
 	if cfg.Database {
-		file, dbErr := db.GetFileByPieceCid(rootCid.String())
-		if dbErr != nil {
-			errorResponse(res, statusLogger, http.StatusInternalServerError, dbErr)
-			return false, trustlessutils.Request{}, ""
+		dbFile, err = db.GetFileByPieceCid(rootCid.String())
+		if err != nil {
+			errorResponse(res, statusLogger, http.StatusInternalServerError, err)
+			return false, trustlessutils.Request{}, nil
 		}
-		if file != nil {
-			newCid, parseErr := cid.Parse(file.CID)
+		if dbFile != nil {
+			newCid, parseErr := cid.Parse(dbFile.CID)
 			if parseErr == nil {
 				rootCid = newCid
-				dbFilename = file.Name // Store filename from database
 			} else {
 				errorResponse(res, statusLogger, http.StatusInternalServerError, parseErr)
-				return false, trustlessutils.Request{}, ""
+				return false, trustlessutils.Request{}, nil
 			}
 		} else {
 			errorResponse(res, statusLogger, http.StatusNotFound, errors.New("CID not found"))
-			return false, trustlessutils.Request{}, ""
+			return false, trustlessutils.Request{}, nil
 		}
 	}
 
 	accepts, err := trustlesshttp.CheckFormat(req)
 	if err != nil {
 		errorResponse(res, statusLogger, http.StatusBadRequest, err)
-		return false, trustlessutils.Request{}, ""
+		return false, trustlessutils.Request{}, nil
 	}
 	// TODO: accepts[0] should be acceptable but it may be for a
 	// application/ipld.vnd.raw (IsRaw()) which we don't currently support; we
@@ -315,13 +321,13 @@ func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath str
 	dagScope, err := trustlesshttp.ParseScope(req)
 	if err != nil {
 		errorResponse(res, statusLogger, http.StatusBadRequest, err)
-		return false, trustlessutils.Request{}, ""
+		return false, trustlessutils.Request{}, nil
 	}
 
 	byteRange, err := trustlesshttp.ParseByteRange(req)
 	if err != nil {
 		errorResponse(res, statusLogger, http.StatusBadRequest, err)
-		return false, trustlessutils.Request{}, ""
+		return false, trustlessutils.Request{}, nil
 	}
 
 	return true, trustlessutils.Request{
@@ -330,25 +336,25 @@ func decodeRequest(res http.ResponseWriter, req *http.Request, unescapedPath str
 		Scope:      dagScope,
 		Bytes:      byteRange,
 		Duplicates: accept.Duplicates,
-	}, dbFilename
+	}, dbFile
 }
 
-func decodeRetrievalRequest(cfg HttpServerConfig, res http.ResponseWriter, req *http.Request, unescapedPath string, statusLogger *statusLogger) (bool, types.RetrievalRequest, string) {
-	ok, request, dbFilename := decodeRequest(res, req, unescapedPath, cfg, statusLogger)
+func decodeRetrievalRequest(cfg HttpServerConfig, res http.ResponseWriter, req *http.Request, unescapedPath string, statusLogger *statusLogger) (bool, types.RetrievalRequest, *db.File) {
+	ok, request, dbFile := decodeRequest(res, req, unescapedPath, cfg, statusLogger)
 	if !ok {
-		return false, types.RetrievalRequest{}, ""
+		return false, types.RetrievalRequest{}, nil
 	}
 
 	protocols, err := parseProtocols(req)
 	if err != nil {
 		errorResponse(res, statusLogger, http.StatusBadRequest, err)
-		return false, types.RetrievalRequest{}, ""
+		return false, types.RetrievalRequest{}, nil
 	}
 
 	providers, err := parseProviders(req)
 	if err != nil {
 		errorResponse(res, statusLogger, http.StatusBadRequest, err)
-		return false, types.RetrievalRequest{}, ""
+		return false, types.RetrievalRequest{}, nil
 	}
 
 	// extract block limit from query param as needed
@@ -366,7 +372,7 @@ func decodeRetrievalRequest(cfg HttpServerConfig, res http.ResponseWriter, req *
 	retrievalId, err := types.NewRetrievalID()
 	if err != nil {
 		errorResponse(res, statusLogger, http.StatusInternalServerError, fmt.Errorf("failed to generate retrieval ID: %w", err))
-		return false, types.RetrievalRequest{}, ""
+		return false, types.RetrievalRequest{}, nil
 	}
 
 	linkSystem := cidlink.DefaultLinkSystem()
@@ -380,7 +386,7 @@ func decodeRetrievalRequest(cfg HttpServerConfig, res http.ResponseWriter, req *
 		Protocols:   protocols,
 		Providers:   providers,
 		MaxBlocks:   maxBlocks,
-	}, dbFilename
+	}, dbFile
 }
 
 // statusLogger is a logger for logging response statuses for a given request
