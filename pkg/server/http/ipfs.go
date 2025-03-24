@@ -36,7 +36,8 @@ import (
 func setCorsHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Request-Id")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Request-Id, Content-Disposition")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition, Content-Type")
 }
 
 func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.ResponseWriter, *http.Request) {
@@ -79,10 +80,13 @@ func IpfsHandler(fetcher types.Fetcher, cfg HttpServerConfig) func(http.Response
 			errorResponse(res, statusLogger, http.StatusBadRequest, err)
 			return
 		}
+		fmt.Println("filename initial: ", fileName)
 
 		if fileName == "" && dbFile != nil && dbFile.Name != "" {
 			fileName = dbFile.Name
 		}
+
+		fmt.Println("filename after db: ", fileName)
 
 		// If still no filename, use default CID-based name
 		if fileName == "" {
